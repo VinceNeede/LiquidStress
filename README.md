@@ -2,6 +2,8 @@
 
 Monte Carlo simulation for emergency fund optimization. Models bucket-strategy portfolios with cascading liquidity tiers under stochastic unforeseen expenses. Stress-tests cash reserves, emergency funds, and asset allocation to minimize costly liquidations during financial emergencies. Built in Julia.
 
+**🚀 [Try the Interactive Demo](https://vinceneede.github.io/LiquidStress/Simulation.html)**
+
 ## 🎯 Why LiquidStress?
 
 The traditional "3-6 months of expenses" emergency fund rule is oversimplified. **LiquidStress** goes beyond this by:
@@ -49,4 +51,4 @@ LiquidStress uses a **bucket/cascade design** with prioritized liquidity tiers:
 - **Optimization insights**: Right-size your emergency funds
 
 ## 📚 Usage
-Check the `Pluto` notebook for detailed usage and methodology.
+Check the `Pluto` [notebook](https://vinceneede.github.io/LiquidStress/Simulation.html) for detailed usage and methodology.
