@@ -47,3 +47,6 @@ LiquidStress uses a **bucket/cascade design** with prioritized liquidity tiers:
 - **Balance trajectories**: Mean evolution and confidence intervals
 - **Risk metrics**: Worst-case scenarios and tail risk analysis
 - **Optimization insights**: Right-size your emergency funds
+
+## 📚 Usage
+Check the `Pluto` notebook for detailed usage and methodology.
