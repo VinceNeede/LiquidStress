@@ -5,15 +5,12 @@ using Markdown
 using InteractiveUtils
 
 # ╔═╡ fed98dd5-8368-41bb-8507-4273e8ac3e13
-using Distributions,
-	StatsPlots,
-	Statistics
-
-# ╔═╡ 5fd2e226-7ac9-11f0-2de6-1946ff5471c9
 begin
-	cd(joinpath(homedir(), "investiments"))
-	include("bucket_simulation.jl")
-end;
+	using Distributions,
+		StatsPlots,
+		Statistics
+	md"Imports"
+end
 
 # ╔═╡ d1a1d729-d8d3-4463-89ce-3c71e8c51dca
 md"""
@@ -22,6 +19,606 @@ The aim of this simulation is to try to estimate how much liquidity we need to k
 
 We are going to use a bucket strategy. The idea is that we are going to have more liquid and less profittable bucket first, and then less liquid and better paid asset later. When we want to withdraw we want our more liquid buckets to have enough money to don't make us withdraw from the less liquid ones (in many cases we could loose interests or, if they are volatile, we may have to sell at a loss).
 """
+
+# ╔═╡ d57a1c49-c0ca-4b01-a02f-679492764c05
+begin
+	"""
+	The idea of this bucket system is to manage funds across different types of buckets, each with specific rules for deposits and balances.
+	
+	The `Portfolio` is a wrapper around a vector of buckets, with a priority order. Lower the index, higher the priority.
+	
+	The first bucket is the most liquid and has higher priority, meaning that when depositing or withdrawing it will
+	be accessed first.
+	
+	A bucket is accessed when depositing funds if, and only if, all previous buckets have at least a balance of `min_reserve`.
+	
+	Similarly, when withdrawing funds, the bucket is accessed only if all previous buckets are empty.
+	
+	"""
+	
+	abstract type AbstractBucket end
+	
+	
+	"""
+	    SinkBucket(name::String, min_reserve::Float64, balance::Float64)
+	A bucket that acts as a sink for excess funds, with a minimum reserve that must be reached and mantained before filling the next bucket.
+	"""
+	mutable struct SinkBucket <: AbstractBucket
+	    name::String
+	    min_reserve::Float64
+	    balance::Float64
+	end
+	
+	"""
+	    BoundedBucket(name::String, min_reserve::Float64, max_capacity::Float64, balance::Float64)
+	A bucket with a minimum reserve and a maximum capacity. It can hold funds up to its maximum capacity.
+	"""
+	mutable struct BoundedBucket <: AbstractBucket
+	    name::String
+	    min_reserve::Float64
+	    max_capacity::Float64
+	    balance::Float64
+	end
+	
+	"""
+	    TransactionBucket(name::String, min_reserve::Float64, min_transaction::Float64, max_capacity::Float64, balance::Float64)
+	A bucket that allows transactions with a minimum transaction amount, a minimum reserve, and a maximum capacity
+	"""
+	mutable struct TransactionBucket <: AbstractBucket
+	    name::String
+	    min_reserve::Float64
+	    min_transaction::Float64
+	    max_capacity::Float64  # Always bounded
+	    balance::Float64
+	end
+	
+	struct Portfolio
+	    buckets::Vector{AbstractBucket}
+	end
+	
+	function Portfolio(buckets::Vararg{AbstractBucket})
+	    Portfolio(collect(buckets))
+	end
+	
+	# Base.show overloads for pretty printing
+	function Base.show(io::IO, b::SinkBucket)
+	    print(io, "SinkBucket(\"$(b.name)\", balance=$(round(b.balance, digits=2)), min=$(b.min_reserve))")
+	end
+	
+	function Base.show(io::IO, b::BoundedBucket)
+	    print(io, "BoundedBucket(\"$(b.name)\", balance=$(round(b.balance, digits=2)), min=$(b.min_reserve), max=$(b.max_capacity))")
+	end
+	
+	# Base.show overload - simplified
+	function Base.show(io::IO, b::TransactionBucket)
+	    print(io, "TransactionBucket(\"$(b.name)\", balance=$(round(b.balance, digits=2)), min=$(b.min_reserve), max=$(b.max_capacity), min_tx=$(b.min_transaction))")
+	end
+	
+	function Base.show(io::IO, p::Portfolio)
+	    println(io, "Portfolio with $(length(p.buckets)) buckets:")
+	    for (i, b) in enumerate(p.buckets)
+	        println(io, "  [$i] $b")
+	    end
+	end
+	
+	
+	############# Some utility functions #############
+	
+	"""
+	    isfull(bucket::AbstractBucket) -> Bool
+	
+	Check if a bucket has reached its maximum capacity.
+	Returns `false` for `SinkBucket` since it has unlimited capacity.
+	"""
+	isfull(b::AbstractBucket) = b.balance >= b.max_capacity
+	isfull(b::SinkBucket) = false  # SinkBucket has no max capacity
+	
+	"""
+	    can_deposit(bucket::AbstractBucket, amount::Float64) -> Bool
+	
+	Check if a bucket can accept a deposit of the given amount.
+	For `TransactionBucket`, also checks if the amount meets the minimum transaction requirement.
+	"""
+	can_deposit(b::AbstractBucket, ::Float64) = !isfull(b)
+	can_deposit(b::TransactionBucket, amount::Float64) = amount >= b.min_transaction && !isfull(b)
+	
+	"""
+	    amount_too_small(bucket::AbstractBucket, amount::Float64) -> Bool
+	
+	Check if the amount is too small for the bucket's transaction requirements.
+	Only relevant for `TransactionBucket` which has minimum transaction amounts.
+	"""
+	amount_too_small(b::AbstractBucket, ::Float64) = false
+	amount_too_small(b::TransactionBucket, amount::Float64) = amount < b.min_transaction
+	
+	############# Deposit functions #############
+	
+	"""
+	    deposit!(bucket::BoundedBucket, amount::Float64) -> Float64
+	
+	Deposit funds into a bounded bucket up to its maximum capacity.
+	Returns the amount that could not be deposited due to capacity constraints.
+	"""
+	function deposit!(bucket::BoundedBucket, amount::Float64)
+	    amount <= 0 && return 0.0
+	
+	    available = bucket.max_capacity - bucket.balance
+	    place = min(amount, available)
+	    bucket.balance += place
+	    return amount - place
+	end
+	
+	"""
+	    deposit!(bucket::TransactionBucket, amount::Float64) -> Float64
+	
+	Deposit funds into a transaction bucket, respecting minimum transaction amounts.
+	Returns the amount that could not be deposited due to capacity or transaction constraints.
+	"""
+	function deposit!(bucket::TransactionBucket, amount::Float64)
+	    amount <= 0 && return 0.0
+	
+	    # Must meet minimum transaction
+	    amount < bucket.min_transaction && return amount
+	
+	    available = bucket.max_capacity - bucket.balance
+	    place = min(amount, available)
+	    place < bucket.min_transaction && return amount
+	
+	    bucket.balance += place
+	    return amount - place
+	end
+	
+	"""
+	    deposit!(bucket::SinkBucket, amount::Float64) -> Float64
+	
+	Deposit funds into a sink bucket, which accepts all funds without limit.
+	Always returns 0.0 since sink buckets have unlimited capacity.
+	"""
+	function deposit!(bucket::SinkBucket, amount::Float64)
+	    amount <= 0 && return 0.0
+	    bucket.balance += amount
+	    return 0.0
+	end
+	
+	"""
+	When depositing funds, the function will iterate through the buckets in order of priority.
+	Once a bucket is filled above its `min_reserve`, it will attempt to deposit the excess into the next bucket.
+	If the following bucket is a `TransactionBucket` and the excess amount is less than its `min_transaction`, it will not deposit into that bucket
+	and the excess will remain in the current bucket. This also means that before a `TransactionBucket` there must always be a 
+	bucket that can hold an excess funds greater than or equal to the `min_transaction` of the next bucket.
+	"""
+	function deposit!(portfolio::Portfolio, amount::Float64; rebalance::Bool=true)
+	    amount <= 0 && throw(ArgumentError("Deposit amount must be positive"))
+	    remaining = amount
+	
+	    for bucket in portfolio.buckets
+	        remaining <= 0 && break
+	        remaining = deposit!(bucket, remaining)
+	    end
+	    if remaining > 0
+	        throw(ArgumentError("Could not deposit all funds. Remaining: $remaining"))
+	    end
+	    rebalance && rebalance!(portfolio)
+	    return portfolio
+	end
+	
+	function rebalance!(portfolio::Portfolio, bucket::TransactionBucket, bucket_idx::Int)
+	    # Do nothing - TransactionBucket should not be rebalanced
+	    return
+	end
+	
+	"""
+	    rebalance!(portfolio::Portfolio, bucket::AbstractBucket, idx::Int)
+	
+	Rebalance excess funds from a bucket to subsequent lower-priority buckets.
+	Moves funds above the bucket's `min_reserve` to the next available buckets,
+	respecting transaction minimums for `TransactionBucket`s.
+	"""
+	function rebalance!(portfolio::Portfolio, bucket::AbstractBucket, idx::Int)
+	    excess = bucket.balance - bucket.min_reserve
+	    if excess > 0
+	        for next_bucket in portfolio.buckets[idx+1:end]
+	            if amount_too_small(next_bucket, excess)
+	                break
+	            end
+	
+	            if can_deposit(next_bucket, excess)
+	                remaining = deposit!(next_bucket, excess)
+	                deposited = excess - remaining
+	                bucket.balance -= deposited
+	                excess = remaining
+	
+	                if excess <= 0
+	                    break
+	                end
+	            end
+	        end
+	    end
+	end
+	
+	"""
+	    rebalance!(portfolio::Portfolio)
+	
+	Rebalance all buckets in the portfolio, moving excess funds from each bucket
+	to subsequent buckets according to priority and capacity constraints.
+	"""
+	function rebalance!(portfolio::Portfolio)
+	    for (idx, bucket) in enumerate(portfolio.buckets)
+	        rebalance!(portfolio, bucket, idx)
+	    end
+	    return
+	end
+	
+	############# Withdraw functions #############
+	
+	"""
+	    withdraw!(portfolio::Portfolio, bucket::AbstractBucket, amount::Float64) -> Float64
+	
+	Withdraw funds from a standard bucket (SinkBucket or BoundedBucket).
+	Returns the amount that could not be withdrawn (remaining needed).
+	"""
+	function withdraw!(::Portfolio, bucket::AbstractBucket, amount::Float64)
+	    amount <= 0 && return 0.0
+	
+	    place = min(amount, bucket.balance)
+	    bucket.balance -= place
+	    return amount - place
+	end
+	
+	"""
+	    withdraw!(portfolio::Portfolio, bucket::TransactionBucket, amount::Float64) -> Float64
+	
+	Withdraw funds from a transaction bucket, respecting minimum transaction amounts.
+	If withdrawal amount is less than `min_transaction`, no withdrawal occurs.
+	If forced to withdraw more than requested (due to min_transaction), excess is
+	deposited back into the portfolio with rebalancing.
+	Returns the amount that could not be withdrawn.
+	"""
+	function withdraw!(port::Portfolio, bucket::TransactionBucket, amount::Float64)
+	    amount <= 0 && return 0.0
+	
+	    if bucket.balance < bucket.min_transaction
+	        return amount  # Cannot withdraw if balance is less than min_transaction
+	    end
+	
+	    place = min(amount, bucket.balance)
+	    place = max(place, bucket.min_transaction)  # Ensure we withdraw at least the minimum transaction amount
+	
+	    bucket.balance -= place
+	    excess = place - amount
+	    if excess > 0
+	        # If we withdrew more than requested, we need to deposit the excess back
+	        deposit!(port, excess)
+	        return 0.0  # Successfully withdrew the requested amount
+	    end
+	
+	    return amount - place
+	end
+	
+	"""
+	    withdraw!(portfolio::Portfolio, amount::Float64) -> Int
+	
+	Withdraw funds from the portfolio, accessing buckets in priority order.
+	Throws an error if insufficient funds are available.
+	Returns the index of the last bucket accessed during withdrawal.
+	
+	# Arguments
+	- `portfolio::Portfolio`: The portfolio to withdraw from
+	- `amount::Float64`: The amount to withdraw
+	
+	# Returns
+	- `Int`: Index of the last bucket that was accessed during withdrawal
+	
+	# Throws
+	- `ArgumentError`: If withdrawal amount is non-positive or insufficient funds available
+	"""
+	function withdraw!(portfolio::Portfolio, amount::Float64)
+	    amount <= 0 && throw(ArgumentError("Withdrawal amount must be positive"))
+	    remaining = amount
+	    last_accessed = 0
+	
+	    for (idx, bucket) in enumerate(portfolio.buckets)
+	        remaining <= 0 && break
+	
+	        # if the bucket is empty
+	        if bucket.balance == 0
+	            continue  # Skip empty buckets
+	        end
+	
+	        last_accessed = idx
+	        remaining = withdraw!(portfolio, bucket, remaining)
+	
+	    end
+	
+	    return last_accessed
+	end
+	
+	function bucket_names(portfolio::Portfolio)
+	    return [b.name for b in portfolio.buckets]
+	end
+	
+	function balances(portfolio::Portfolio)
+	    return [b.balance for b in portfolio.buckets]
+	end
+	
+	function Base.deepcopy(portfolio::Portfolio)
+	    return Portfolio([deepcopy(bucket) for bucket in portfolio.buckets])
+	end
+	
+	function Base.deepcopy(bucket::SinkBucket)
+	    return SinkBucket(bucket.name, bucket.min_reserve, bucket.balance)
+	end
+	
+	function Base.deepcopy(bucket::BoundedBucket)
+	    return BoundedBucket(bucket.name, bucket.min_reserve, bucket.max_capacity, bucket.balance)
+	end
+	
+	function Base.deepcopy(bucket::TransactionBucket)
+	    return TransactionBucket(bucket.name, bucket.min_reserve, bucket.min_transaction, bucket.max_capacity, bucket.balance)
+	end
+	
+	# Example usage
+	function example()
+	    port = Portfolio(
+	        BoundedBucket("Liquidity", 2500, 2500, 0),
+	        SinkBucket("SavingAccount", 1000, 0),
+	        TransactionBucket("Bonds", 4000, 1000, 5000, 0),
+	        SinkBucket("ETF", 0, 0),
+	    )
+	    println("Initial Portfolio:")
+	    @show port
+	    for amount in [2000, 600, 400, 100, 2000, 1900, 2000]
+	        println("Depositing $amount")
+	        deposit!(port, float(amount))
+	        @show port
+	    end
+	    for amount in [2000, 600, 400, 100, 2000, 500, 2000]
+	        println("Withdrawing $amount")
+	        idx = withdraw!(port, float(amount))
+	        @show port
+	        println("Last accessed bucket index: $idx")
+	    end
+	end
+md"Portfolio logic implementation"
+end
+
+# ╔═╡ 32637308-ed05-40ce-a64e-89f14f6d280d
+begin
+	import Random: Random, AbstractRNG
+		
+	"""
+	    Unforseen{T<:DiscreteUnivariateDistribution, Q<:ContinuousUnivariateDistribution}
+	
+	A structure to model unforeseen events with stochastic frequency and magnitude.
+	Combines a discrete distribution for event occurrence with a continuous distribution for event values.
+	
+	# Fields
+	- `db_event::T`: Discrete distribution modeling the frequency/number of unforeseen events
+	- `db_value::Q`: Continuous distribution modeling the magnitude/cost of each unforeseen event
+	"""
+	struct Unforseen{T<:DiscreteUnivariateDistribution,Q<:ContinuousUnivariateDistribution}
+	    db_event::T
+	    db_value::Q
+	    function Unforseen(DB1::T, DB2::Q) where {T<:DiscreteUnivariateDistribution,Q<:ContinuousUnivariateDistribution}
+	        new{T,Q}(DB1, DB2)
+	    end
+	end
+	
+	"""
+	    Unforseen(mean_frequency::Float64, mean_value::Float64, std_value::Float64) -> Unforseen
+	
+	Convenience constructor for unforeseen events using common parameters.
+	
+	Creates an `Unforseen` struct with:
+	- Poisson distribution for event frequency (discrete)
+	- Gamma distribution for event magnitude (continuous)
+	
+	# Arguments
+	- `mean_frequency::Float64`: Average number of unforeseen events per time period
+	- `mean_value::Float64`: Average cost/magnitude of each unforeseen event
+	- `std_value::Float64`: Standard deviation of the cost/magnitude
+	
+	# Returns
+	- `Unforseen`: Configured unforeseen event model
+	
+	# Example
+	```julia
+	# Model emergency expenses: 1.5 events per month, avg cost 2000, std dev 800
+	emergency_expenses = Unforseen(1.5, 2000.0, 800.0)
+	
+	# Sample number of events this period
+	num_events = rand(emergency_expenses.db_event)
+	
+	# Sample the cost of each event
+	total_cost = sum(rand(emergency_expenses.db_value) for _ in 1:num_events)
+	```
+	"""
+	function Unforseen(mean_frequency::Float64, mean_value::Float64, std_value::Float64)
+	    db_event = Poisson(mean_frequency)
+	    db_value = Gamma(mean_value^2 / std_value^2, std_value^2 / mean_value)
+	    return Unforseen(db_event, db_value)
+	end
+	
+	"""
+	    rand(unforseens::AbstractVector{Unforseen}) -> Float64
+	
+	Sample the total cost of unforeseen events across multiple categories for one time period.
+	
+	For each `Unforseen` in the vector:
+	1. Samples the number of events from the frequency distribution
+	2. Samples the cost of each event from the magnitude distribution  
+	3. Sums the total cost for that category
+	
+	Returns the sum of costs across all unforeseen event categories.
+	
+	# Arguments
+	- `unforseens::AbstractVector{Unforseen}`: Vector of different unforeseen event types
+	
+	# Returns
+	- `Float64`: Total cost of all unforeseen events for this time period
+	
+	# Example
+	```julia
+	unforeseen_events = [
+	    Unforseen(0.5, 3000.0, 1000.0),  # Major repairs
+	    Unforseen(1.2, 500.0, 200.0),   # Minor emergencies
+	    Unforseen(0.1, 10000.0, 5000.0) # Medical emergencies
+	]
+	
+	# Sample total unforeseen costs for this month
+	total_unforeseen_cost = rand(unforeseen_events)
+	```
+	"""
+	function Base.rand(rng::AbstractRNG, unforseen::Unforseen)
+	    num_events = rand(rng, unforseen.db_event)
+	    return sum(rand(rng, unforseen.db_value, num_events))
+	end
+	
+	# Convenience method without specifying RNG
+	function Base.rand(unforseen::Unforseen)
+	    return rand(Random.default_rng(), unforseen)
+	end
+	
+	function run_simulation(
+	    portfolio::Portfolio,
+	    starting_capital::Float64,
+	    salary::Float64,
+	    fixed_expenses::Float64,
+	    unforseens::AbstractVector{<:Unforseen},
+	    N_trajectories::Int,
+	    N_months::Int,
+	)
+	
+	    N_buckets = length(portfolio.buckets)
+	    trajectories = Matrix{Portfolio}(undef, N_months, N_trajectories)
+	    bucket_accesses = zeros(Bool, N_months, N_trajectories, N_buckets)
+	
+	    for i in 1:N_trajectories
+	        traj_portfolio = deepcopy(portfolio)  # Create a copy for each trajectory
+	        deposit!(traj_portfolio, starting_capital)  # Initialize with starting capital
+	
+	        for month in 1:N_months
+	            # Add salary to the portfolio
+	            deposit!(traj_portfolio, salary)
+	
+	            expenses = fixed_expenses
+	            expenses += sum(rand(unforseen) for unforseen in unforseens)
+	            bucket_accesses[month, i, withdraw!(traj_portfolio, expenses)] = true  # Mark which buckets were accessed
+	            trajectories[month, i] = deepcopy(traj_portfolio)
+	        end
+	    end
+	    return trajectories, bucket_accesses
+	end
+	
+	
+	function get_balances(trajectories::Matrix{Portfolio})
+	    N_months, N_trajectories = size(trajectories)
+	
+	    starting_portfolio = trajectories[1, 1]
+	    N_buckets = length(starting_portfolio.buckets)
+	    sim_balances = Array{Float64}(undef, N_buckets, N_months, N_trajectories)
+	
+	    for (i_traj, traj) in enumerate(eachcol(trajectories))
+	        for (i_month, month_portfolio) in enumerate(traj)
+	            sim_balances[:, i_month, i_traj] = balances(month_portfolio)
+	        end
+	    end
+	    return sim_balances
+	end
+	
+	function plot_trajectories(sim_balances::Array{Float64, 3}, bucket_names::Vector{String})
+	    N_buckets = size(sim_balances, 1)
+	    @assert N_buckets == length(bucket_names) "Number of buckets must match number of bucket names"
+	
+	    # Create subplots layout
+	    n_cols = min(3, N_buckets)  # Max 3 columns
+	    n_rows = ceil(Int, N_buckets / n_cols)
+	    
+	    plots = []
+	    
+	    for bucket in 1:N_buckets
+	        p = plot(
+	            title = bucket_names[bucket],
+	            xlabel = "Month",
+	            ylabel = "Balance",
+	            legend = false,
+	            grid = true
+	        )
+	        
+	        # Use errorline! for this bucket's data
+	        errorline!(p, sim_balances[bucket, :, :])
+	        
+	        push!(plots, p)
+	    end
+	    
+	    # Combine all subplots
+	    return plot(plots..., 
+	                layout = (n_rows, n_cols),
+	                size = (300 * n_cols, 250 * n_rows),
+	                plot_title = "Bucket Balances Over Time")
+	end
+	
+	
+	"""
+	    get_bucket_usage_stats(bucket_accesses::Array{Bool, 3}, bucket_names::Vector{String}) -> Dict{String, Vector{Float64}}
+	
+	Compute the distribution of bucket access frequencies across simulation trajectories.
+	
+	For each bucket, returns a vector showing how many times that bucket level (or deeper) 
+	was accessed in each trajectory during the simulation period.
+	
+	# Arguments
+	- `bucket_accesses::Array{Bool, 3}`: 3D boolean array with dimensions (N_months, N_trajectories, N_buckets).
+	  `bucket_accesses[month, traj, bucket]` is `true` if `bucket` was accessed in that month/trajectory.
+	- `bucket_names::Vector{String}`: Names of the buckets for labeling the output.
+	
+	# Returns
+	- `Dict{String, Vector{Float64}}`: Dictionary mapping each bucket name to a vector of length `N_trajectories`.
+	  Each element in the vector represents the total number of months that bucket level (or deeper) 
+	  was accessed in that specific trajectory.
+	
+	# Interpretation
+	- `stats["Emergency Fund"][i]` = number of months trajectory `i` needed to access the Emergency Fund or deeper buckets
+	- `stats["Deep Emergency"][i]` = number of months trajectory `i` needed to access the Deep Emergency or deeper buckets
+	- Higher values indicate trajectories that experienced more frequent financial stress requiring deeper bucket access
+	
+	# Example Output
+	```julia
+	Dict(
+	    "Cash" => [12.0, 8.0, 15.0, 6.0, ...],        # Each trajectory's months accessing Cash+
+	    "Emergency Fund" => [3.0, 0.0, 7.0, 1.0, ...], # Each trajectory's months accessing Emergency+
+	    "Deep Emergency" => [0.0, 0.0, 2.0, 0.0, ...]  # Each trajectory's months accessing Deep Emergency+
+	)
+	```
+	
+	# Usage for Further Analysis
+	This distribution can be used to:
+	- Calculate percentiles: `quantile(stats["Emergency Fund"], [0.5, 0.95])` for median and 95th percentile
+	- Compute summary statistics: `mean(stats["Emergency Fund"])` for average usage
+	- Analyze risk: `count(x -> x > 5, stats["Emergency Fund"])` for trajectories with >5 months of emergency fund usage
+	- Plot histograms: `histogram(stats["Emergency Fund"])` to visualize the distribution
+	
+	# Notes
+	- Statistics are cumulative: accessing bucket N means buckets 1 through N were all insufficient
+	- The `bucket_accesses` array should have exactly one `true` per (month, trajectory) pair since only one bucket is accessed per withdrawal
+	- Vector length equals `N_trajectories` from the simulation
+	"""
+	function get_bucket_usage_stats(bucket_accesses::Array{Bool, 3}, bucket_names::Vector{String})
+	    N_months, N_trajectories, N_buckets = size(bucket_accesses)
+	    
+	    stats = Dict{String, Vector{Float64}}()
+	    
+	    for bucket in 1:N_buckets
+	        # Check if this bucket or any deeper bucket was accessed
+	        accessed_this_deep = dropdims(any((bucket_accesses[:, :, bucket:end]), dims=3), dims=3)
+	
+	        stats[bucket_names[bucket]] = dropdims(sum(accessed_this_deep, dims=1), dims=1)
+	    end
+	    
+	    return stats
+	end
+md"Simulation implementation"
+end
 
 # ╔═╡ 50aff0c5-f8d0-496d-9768-964f41c41559
 md"""
@@ -201,6 +798,7 @@ In particular with a fixed expense of 1100€, we must have
 PLUTO_PROJECT_TOML_CONTENTS = """
 [deps]
 Distributions = "31c24e10-a181-5473-b8eb-7969acd0382f"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 StatsPlots = "f3b207a7-027a-5e70-b257-86293d7955fd"
 
@@ -215,7 +813,7 @@ PLUTO_MANIFEST_TOML_CONTENTS = """
 
 julia_version = "1.11.6"
 manifest_format = "2.0"
-project_hash = "1b716dbff2197a856af1f0ced5e442b32cec6bbf"
+project_hash = "476a6925d3aded5e50cea985df1d088bd17192c8"
 
 [[deps.AbstractFFTs]]
 deps = ["LinearAlgebra"]
@@ -1636,8 +2234,9 @@ version = "1.9.2+0"
 
 # ╔═╡ Cell order:
 # ╟─d1a1d729-d8d3-4463-89ce-3c71e8c51dca
-# ╠═fed98dd5-8368-41bb-8507-4273e8ac3e13
-# ╠═5fd2e226-7ac9-11f0-2de6-1946ff5471c9
+# ╟─fed98dd5-8368-41bb-8507-4273e8ac3e13
+# ╟─d57a1c49-c0ca-4b01-a02f-679492764c05
+# ╟─32637308-ed05-40ce-a64e-89f14f6d280d
 # ╟─50aff0c5-f8d0-496d-9768-964f41c41559
 # ╠═1a5ae146-b831-4167-b3ae-e6cc0b4af291
 # ╟─66f1ebd8-08c2-4221-bacb-f93828461c3f
